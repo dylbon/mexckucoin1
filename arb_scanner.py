@@ -2,13 +2,12 @@ import ccxt
 import time
 import telegram
 from telegram.ext import Application
-from itertools import combinations
 
-# Configuration - Replace with your NEW Telegram bot token
-TELEGRAM_BOT_TOKEN = '8443986784:AAE7fP0iMoiZZmMSn7AJkT4CvrB2k52ygEE'  # Your new token
-TELEGRAM_CHAT_ID = '7297679984'  # Your confirmed chat ID
+# Configuration
+TELEGRAM_BOT_TOKEN = '8443986784:AAE7fP0iMoiZZmMSn7AJkT4CvrB2k52ygEE'
+TELEGRAM_CHAT_ID = '7297679984'
 
-MIN_SPREAD = 1.0  # % threshold for alert
+MIN_SPREAD = 0.01  # % threshold for alert
 SCAN_INTERVAL = 30  # seconds between scans
 
 # Initialize exchanges (public endpoints, no API keys)
@@ -21,6 +20,7 @@ exchanges = {
 # Telegram setup
 app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 bot = app.bot
+bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="Bot started! Testing Telegram locally at 2025-10-24 16:39 CEST.")
 
 def send_alert(message):
     """Send Telegram alert"""
@@ -51,7 +51,7 @@ def load_common_stable_pairs():
         print(f"Error loading pairs: {e}")
         return [], {}
 
-# Known fast-chain tokens - extend as needed
+# Known fast-chain tokens
 FAST_CHAIN_TOKENS = {
     'BONK': 'Solana', 'JUP': 'Solana', 'BOSS': 'Solana',
     'GATA': 'BNB', 'OPEN': 'BNB',
@@ -68,7 +68,7 @@ def get_chain_hint(pair):
 PAIRS, MARKETS = load_common_stable_pairs()
 
 def check_arbitrage():
-    """Check for arb opps, prioritizing Binance for buys"""
+    """Check for arb opportunities, prioritizing Binance for buys"""
     prices = {}
     for name, ex in exchanges.items():
         prices[name] = {}
