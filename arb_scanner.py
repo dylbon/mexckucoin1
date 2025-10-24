@@ -5,7 +5,7 @@ from telegram.ext import Application
 from itertools import combinations
 
 # Configuration - Replace with your NEW Telegram bot token
-TELEGRAM_BOT_TOKEN = 'AAE7fP0iMoiZZmMSn7AJkT4CvrB2k52ygE'  # Your new token
+TELEGRAM_BOT_TOKEN = '8443986784:AAE7fP0iMoiZZmMSn7AJkT4CvrB2k52ygEE'  # Your new token
 TELEGRAM_CHAT_ID = '7297679984'  # Your confirmed chat ID
 
 MIN_SPREAD = 1.0  # % threshold for alert
