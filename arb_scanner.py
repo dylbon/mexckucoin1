@@ -1,128 +1,285 @@
-import ccxt
+import requests
 import time
-import telegram
-from telegram.ext import Application
+import signal
+import sys
 
-# Configuration
-TELEGRAM_BOT_TOKEN = '8443986784:AAE7fP0iMoiZZmMSn7AJkT4CvrB2k52ygEE'
-TELEGRAM_CHAT_ID = '7297679984'
+# === CONFIG ===
+BOT_TOKEN = "8212674831:AAFQPexNzzYeprq3J8OuSSNBYsJQE6JM87s"  # New bot
+CHAT_ID = "7297679984"  # Confirmed chat
+THRESHOLD_PERCENT = 3.0          # 3% profit threshold
+CHECK_INTERVAL = 60              # Check every 60 seconds
+MAX_RETRIES = 3
 
-MIN_SPREAD = 0.01  # % threshold for alert
-SCAN_INTERVAL = 30  # seconds between scans
+MEXC_TAKER_FEE = 0.0005
+KRAKEN_TAKER_FEE = 0.0026
+KUCOIN_TAKER_FEE = 0.001
 
-# Initialize exchanges (public endpoints, no API keys)
-exchanges = {
-    'mexc': ccxt.mexc({'enableRateLimit': True}),
-    'kucoin': ccxt.kucoin({'enableRateLimit': True}),
-    'binance': ccxt.binance({'enableRateLimit': True})
+BLACKLIST = {'ALPHA', 'UTK', 'THETA', 'AERGO', 'MOVE'}  # Applied globally
+
+SYMBOL_MAP = {
+    'LUNA': 'LUNC',
+    'LUNA2': 'LUNA',
+    'BTT': 'BTTC',
+    'NANO': 'XNO',
 }
 
-# Telegram setup
-app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-bot = app.bot
-bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="Bot started! Testing Telegram locally at 2025-10-24 16:39 CEST.")
+QUOTE_CURRENCIES = ['USDT', 'USD', 'EUR']
 
-def send_alert(message):
-    """Send Telegram alert"""
-    try:
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-        print(f"Alert sent: {message}")
-    except Exception as e:
-        print(f"Telegram error: {e}")
+def send_telegram(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = requests.post(
+                url,
+                json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"},
+                timeout=5
+            )
+            if resp.ok:
+                print("📤 Telegram message sent! 🎉")
+                return
+        except Exception as e:
+            print(f"❗ Telegram error (attempt {attempt+1}): {e}")
+        time.sleep(2 ** attempt)
+    print("❌ Failed to send Telegram message. 😔")
 
-def load_common_stable_pairs():
-    """Fetch all spot pairs ending with /USDT or /USDC for MEXC and KuCoin"""
-    try:
-        markets = {}
-        mexc_kucoin_pairs = set()
-        for name, ex in exchanges.items():
-            markets[name] = ex.load_markets()
-            pairs = {symbol for symbol, market in markets[name].items() 
-                     if market['spot'] and (symbol.endswith('/USDT') or symbol.endswith('/USDC'))}
-            if name in ['mexc', 'kucoin']:
-                mexc_kucoin_pairs.update(pairs)
-            print(f"{name.capitalize()} loaded {len(pairs)} stable spot pairs.")
-        
-        common_pairs = sorted(mexc_kucoin_pairs)
-        print(f"Scanning {len(common_pairs)} total stable spot pairs (MEXC/KuCoin).")
-        return common_pairs, markets
-    
-    except Exception as e:
-        print(f"Error loading pairs: {e}")
-        return [], {}
+def fetch_mexc_tickers():
+    print("🔄 Fetching ALL MEXC tickers...")
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = requests.get("https://api.mexc.com/api/v3/ticker/24hr", timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                prices = {}
+                for d in data:
+                    symbol = d['symbol']
+                    if any(symbol.endswith(q) for q in QUOTE_CURRENCIES):
+                        prices[symbol] = {
+                            'bid': float(d.get('bidPrice') or 0),
+                            'ask': float(d.get('askPrice') or 0),
+                            'last': float(d['lastPrice'])
+                        }
+                print(f"✅ Fetched {len(prices)} MEXC listings. 🎯\n")
+                return prices
+        except Exception as e:
+            print(f"❗ MEXC error (attempt {attempt+1}): {e}")
+        time.sleep(2 ** attempt)
+    print("❌ Failed to fetch MEXC after retries. 😔")
+    return {}
 
-# Known fast-chain tokens
-FAST_CHAIN_TOKENS = {
-    'BONK': 'Solana', 'JUP': 'Solana', 'BOSS': 'Solana',
-    'GATA': 'BNB', 'OPEN': 'BNB',
-    'SNORT': 'Base/Solana',
-    'SOL': 'Solana', 'BNB': 'BNB'
-}
-
-def get_chain_hint(pair):
-    """Suggest fast chain for a pair"""
-    token = pair.split('/')[0]
-    return FAST_CHAIN_TOKENS.get(token, 'Unknown (check for SOL/BNB/Base support)')
-
-# Load pairs and markets once at startup
-PAIRS, MARKETS = load_common_stable_pairs()
-
-def check_arbitrage():
-    """Check for arb opportunities, prioritizing Binance for buys"""
+def fetch_kraken_tickers():
+    print("🔄 Fetching ALL Kraken tickers...")
     prices = {}
-    for name, ex in exchanges.items():
-        prices[name] = {}
-        for pair in PAIRS:
-            if pair in MARKETS[name]:
-                try:
-                    ticker = ex.fetch_ticker(pair)
-                    prices[name][pair] = ticker['last']
-                except Exception as e:
-                    prices[name][pair] = None
-    
-    for pair in PAIRS:
-        mexc_price = prices['mexc'].get(pair)
-        kucoin_price = prices['kucoin'].get(pair)
-        binance_price = prices['binance'].get(pair)
-        
-        available_prices = []
-        if mexc_price and mexc_price > 0:
-            available_prices.append(('mexc', mexc_price))
-        if kucoin_price and kucoin_price > 0:
-            available_prices.append(('kucoin', kucoin_price))
-        if binance_price and binance_price > 0:
-            available_prices.append(('binance', binance_price))
-        
-        if len(available_prices) >= 2:
-            prices_sorted = sorted(available_prices, key=lambda x: x[1])
-            buy_ex, buy_price = prices_sorted[0]
-            sell_ex, sell_price = prices_sorted[-1]
-            
-            # Prioritize Binance for buying if within 5% of lowest
-            if binance_price and buy_ex != 'binance':
-                binance_spread = ((sell_price - binance_price) / binance_price) * 100
-                if binance_spread > MIN_SPREAD and binance_price <= buy_price * 1.05:
-                    buy_ex, buy_price = 'binance', binance_price
-            
-            spread = ((sell_price - buy_price) / buy_price) * 100
-            if spread > MIN_SPREAD:
-                chain_hint = get_chain_hint(pair)
-                binance_note = " (Funds on Binance ready)" if buy_ex == 'binance' else " (Transfer from Binance if needed)"
-                message = (f"🚨 ARB ALERT: Buy {pair} on {buy_ex.upper()} (${buy_price:.6f}), "
-                          f"Sell on {sell_ex.upper()} (${sell_price:.6f})\n"
-                          f"Spread: {spread:.2f}%{binance_note}\n"
-                          f"Chain: {chain_hint}\n"
-                          f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                send_alert(message)
-                print(f"Opportunity: {pair} ({buy_ex} → {sell_ex}) - {spread:.2f}%")
-    
-    print(f"Scan complete at {time.strftime('%Y-%m-%d %H:%M:%S')}. Next in {SCAN_INTERVAL}s...")
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = requests.get("https://api.kraken.com/0/public/AssetPairs", timeout=10)
+            if resp.status_code == 200:
+                pairs = list(resp.json()['result'].keys())
+                print(f"Kraken has {len(pairs)} pairs. Scanning...")
+                batch_size = 20
+                for i in range(0, len(pairs), batch_size):
+                    batch = ','.join(pairs[i:i+batch_size])
+                    time.sleep(0.05)
+                    resp_t = requests.get(f"https://api.kraken.com/0/public/Ticker?pair={batch}", timeout=5)
+                    if resp_t.status_code == 200:
+                        result = resp_t.json()['result']
+                        for sym, d in result.items():
+                            if 'EUR' in sym or 'ZEUR' in sym:
+                                continue
+                            if any(q in sym for q in ['USD', 'USDT']):
+                                bid_price = float(d['b'][0])
+                                if bid_price > 0:
+                                    prices[sym] = {
+                                        'bid': bid_price,
+                                        'ask': float(d['a'][0]),
+                                        'last': float(d['c'][0])
+                                    }
+                print(f"✅ Fetched {len(prices)} Kraken listings (USD/USDT only). 🎯\n")
+                return prices
+        except Exception as e:
+            print(f"❗ Kraken error (attempt {attempt+1}): {e}")
+        time.sleep(2 ** attempt)
+    print("❌ Failed to fetch Kraken after retries. 😔")
+    return {}
+
+def fetch_kucoin_tickers():
+    print("🔄 Fetching ALL KuCoin tickers...")
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = requests.get("https://api.kucoin.com/api/v1/market/allTickers", timeout=10)
+            if resp.status_code == 200:
+                data = resp.json().get('data', {}).get('ticker', [])
+                prices = {}
+                for d in data:
+                    symbol = d['symbol']
+                    if any(q in symbol for q in QUOTE_CURRENCIES):
+                        buy_str = d.get('buy') or '0'
+                        sell_str = d.get('sell') or '0'
+                        last_str = d.get('last') or '0'
+                        prices[symbol] = {
+                            'bid': float(buy_str),
+                            'ask': float(sell_str),
+                            'last': float(last_str)
+                        }
+                print(f"✅ Fetched {len(prices)} KuCoin listings. 🎯\n")
+                return prices
+        except Exception as e:
+            print(f"❗ KuCoin error (attempt {attempt+1}): {e}")
+        time.sleep(2 ** attempt)
+    print("❌ Failed to fetch KuCoin after retries. 😔")
+    return {}
+
+def normalize_symbol(symbol):
+    symbol = symbol.replace('-', '').upper()
+    symbol = symbol.replace('XXBT', 'BTC').replace('XBT', 'BTC').replace('ZUSD', 'USD')
+    if len(symbol) > 3:
+        base = SYMBOL_MAP.get(symbol[:-3], symbol[:-3])
+        quote = symbol[-3:]
+    else:
+        base = symbol
+        quote = ''
+    return f"{base}{quote}"
+
+def get_conversion_rate(prices, from_quote, to_quote):
+    if from_quote == to_quote:
+        return 1.0
+    pair = f"{from_quote}{to_quote}"
+    if pair in prices['mexc'] and prices['mexc'][pair]['last'] > 0:
+        return prices['mexc'][pair]['last']
+    inv_pair = f"{to_quote}{from_quote}"
+    if inv_pair in prices['mexc'] and prices['mexc'][inv_pair]['last'] > 0:
+        return 1.0 / prices['mexc'][inv_pair]['last']
+    return None
+
+def check_arbitrage(prices):
+    found = 0
+    all_bases = set()
+
+    for exch_prices in prices.values():
+        for sym in exch_prices:
+            norm = normalize_symbol(sym)
+            if len(norm) > 3:
+                base = norm[:-3]
+                if base in BLACKLIST:
+                    continue
+                all_bases.add(base)
+
+    buy_exchanges = ['mexc']
+    sell_exchanges = ['kraken', 'kucoin']
+    fees = {
+        'mexc': MEXC_TAKER_FEE,
+        'kraken': KRAKEN_TAKER_FEE,
+        'kucoin': KUCOIN_TAKER_FEE
+    }
+
+    for base in all_bases:
+        # Main direction: Buy on MEXC → Sell on Kraken/KuCoin
+        for buy_exch in buy_exchanges:
+            for sell_exch in sell_exchanges:
+                buy_sym = buy_quote = sell_sym = sell_quote = None
+                for q in QUOTE_CURRENCIES:
+                    cand = f"{base}{q}"
+                    if cand in prices.get(buy_exch, {}):
+                        buy_sym = cand if buy_sym is None else buy_sym
+                        buy_quote = q if buy_quote is None else buy_quote
+                    if cand in prices.get(sell_exch, {}):
+                        sell_sym = cand
+                        sell_quote = q
+
+                if not buy_sym or not sell_sym:
+                    continue
+
+                buy_ask = prices[buy_exch][buy_sym].get('ask') or prices[buy_exch][buy_sym]['last']
+                sell_bid = prices[sell_exch][sell_sym].get('bid') or prices[sell_exch][sell_sym]['last']
+
+                if buy_ask <= 0 or sell_bid <= 0:
+                    continue
+
+                conv = get_conversion_rate(prices, buy_quote, sell_quote)
+                if conv is None:
+                    continue
+
+                adjusted_buy = buy_ask * (1 + fees[buy_exch]) * conv
+                adjusted_sell = sell_bid * (1 - fees[sell_exch])
+
+                profit_pct = (adjusted_sell - adjusted_buy) / adjusted_buy * 100
+
+                if profit_pct >= THRESHOLD_PERCENT:
+                    found += 1
+                    msg = (
+                        f"*🚀 Arbitrage Opportunity! 🚀*\n"
+                        f"💸 *Buy {base}* on {buy_exch.upper()}: {buy_ask:.6f} {buy_quote}\n"
+                        f"💰 *Sell on {sell_exch.upper()}*: {sell_bid:.6f} {sell_quote}\n"
+                        f"📈 *Profit*: {profit_pct:.2f}% (after fees) 🎉"
+                    )
+                    print(msg + "\n")
+                    send_telegram(msg)
+
+        # Bidirectional MEXC ↔ KuCoin
+        for buy_exch, sell_exch in [('mexc', 'kucoin'), ('kucoin', 'mexc')]:
+            buy_sym = buy_quote = sell_sym = sell_quote = None
+            for q in QUOTE_CURRENCIES:
+                cand = f"{base}{q}"
+                if cand in prices.get(buy_exch, {}):
+                    buy_sym = cand if buy_sym is None else buy_sym
+                    buy_quote = q if buy_quote is None else buy_quote
+                if cand in prices.get(sell_exch, {}):
+                    sell_sym = cand
+                    sell_quote = q
+
+            if not buy_sym or not sell_sym:
+                continue
+
+            buy_ask = prices[buy_exch][buy_sym].get('ask') or prices[buy_exch][buy_sym]['last']
+            sell_bid = prices[sell_exch][sell_sym].get('bid') or prices[sell_exch][sell_sym]['last']
+
+            if buy_ask <= 0 or sell_bid <= 0:
+                continue
+
+            conv = get_conversion_rate(prices, buy_quote, sell_quote)
+            if conv is None:
+                continue
+
+            adjusted_buy = buy_ask * (1 + fees[buy_exch]) * conv
+            adjusted_sell = sell_bid * (1 - fees[sell_exch])
+
+            profit_pct = (adjusted_sell - adjusted_buy) / adjusted_buy * 100
+
+            if profit_pct >= THRESHOLD_PERCENT:
+                found += 1
+                msg = (
+                    f"*🚀 Arbitrage Opportunity! 🚀*\n"
+                    f"💸 *Buy {base}* on {buy_exch.upper()}: {buy_ask:.6f} {buy_quote}\n"
+                    f"💰 *Sell on {sell_exch.upper()}*: {sell_bid:.6f} {sell_quote}\n"
+                    f"📈 *Profit*: {profit_pct:.2f}% (after fees) 🎉"
+                )
+                print(msg + "\n")
+                send_telegram(msg)
+
+    if found == 0:
+        print(f"😴 No opportunities ≥ {THRESHOLD_PERCENT}% found this cycle.\n")
+    else:
+        print(f"🎉 Found {found} opportunities! 📊\n")
+
+def signal_handler(sig, frame):
+    print("\n🛑 Stopping bot... 👋")
+    sys.exit(0)
 
 if __name__ == "__main__":
-    if not PAIRS:
-        print("No pairs found. Check network or exchange APIs.")
-    else:
-        print(f"Starting MEXC-KuCoin-Binance All Stable Pairs Arb Scanner ({len(PAIRS)} pairs)...")
-        while True:
-            check_arbitrage()
-            time.sleep(SCAN_INTERVAL)
+    signal.signal(signal.SIGINT, signal_handler)
+    print("🚀 Starting arbitrage bot (Only MEXC + Kraken + KuCoin bidirectional) 🌟\n")
+    while True:
+        try:
+            prices = {
+                'mexc': fetch_mexc_tickers(),
+                'kraken': fetch_kraken_tickers(),
+                'kucoin': fetch_kucoin_tickers()
+            }
+            check_arbitrage(prices)
+            print(f"⏳ Waiting {CHECK_INTERVAL} seconds... 😴\n")
+            time.sleep(CHECK_INTERVAL)
+        except KeyboardInterrupt:
+            print("\n🛑 Stopped by user. 👋")
+            break
+        except Exception as e:
+            print(f"❗ Unexpected error: {e}\nContinuing... 😔")
+            time.sleep(CHECK_INTERVAL)
