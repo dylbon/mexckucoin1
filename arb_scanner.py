@@ -4,10 +4,10 @@ import signal
 import sys
 
 # === CONFIG ===
-BOT_TOKEN = "8212674831:AAFQPexNzzYeprq3J8OuSSNBYsJQE6JM87s"  # New bot
-CHAT_ID = "7297679984"  # Confirmed chat
-THRESHOLD_PERCENT = 3.0  # 3% profit threshold
-CHECK_INTERVAL = 60  # Check every 60 seconds
+BOT_TOKEN = "8212674831:AAFQPexNzzYeprq3J8OuSSNBYsJQE6JM87s"
+CHAT_ID = "7297679984"
+THRESHOLD_PERCENT = 3.0
+CHECK_INTERVAL = 60
 MAX_RETRIES = 3
 MEXC_TAKER_FEE = 0.0005
 KRAKEN_TAKER_FEE = 0.0026
@@ -196,31 +196,82 @@ def fetch_kucoin_config():
     config = {}
     for attempt in range(MAX_RETRIES):
         try:
-            resp_currencies = requests.get("https://api.kucoin.com/api/v3/currencies", timeout=10)
-            if resp_currencies.status_code == 200:
-                currencies = resp_currencies.json().get('data', [])
-                for curr in currencies:
-                    coin = curr['currency']
-                    norm_coin = SYMBOL_MAP.get(coin, coin)
-                    if norm_coin in BLACKLIST:
+            resp = requests.get("https://api.kucoin.com/api/v3/currencies", timeout=10)
+            if resp.status_code != 200:
+                print(f"❗ KuCoin currencies endpoint returned status {resp.status_code}")
+                time.sleep(2 ** attempt)
+                continue
+
+            data_json = resp.json()
+            currencies_data = data_json.get('data')
+
+            if currencies_data is None:
+                print("❗ KuCoin /currencies returned 'data': null or missing")
+                time.sleep(2 ** attempt)
+                continue
+
+            if not isinstance(currencies_data, list):
+                print(f"❗ KuCoin 'data' is not a list (got {type(currencies_data).__name__})")
+                time.sleep(2 ** attempt)
+                continue
+
+            currencies = currencies_data
+
+            print(f"→ Found {len(currencies)} currencies to process")
+
+            for curr in currencies:
+                coin = curr.get('currency')
+                if not coin or not isinstance(coin, str):
+                    continue
+
+                norm_coin = SYMBOL_MAP.get(coin, coin)
+                if norm_coin in BLACKLIST:
+                    continue
+
+                try:
+                    detail_resp = requests.get(
+                        f"https://api.kucoin.com/api/v3/currencies/{coin}",
+                        timeout=5
+                    )
+                    if detail_resp.status_code != 200:
                         continue
-                    resp_detail = requests.get(f"https://api.kucoin.com/api/v3/currencies/{coin}", timeout=5)
-                    if resp_detail.status_code == 200:
-                        detail = resp_detail.json().get('data', {})
-                        networks = []
-                        for chain in detail.get('chains', []):
-                            networks.append({
-                                'chain': chain['chainName'].upper(),
-                                'depositEnable': chain.get('isDepositEnabled', False),
-                                'withdrawEnable': chain.get('isWithdrawEnabled', False)
-                            })
-                        if networks:
-                            config[norm_coin] = networks
-                print(f"✅ Fetched KuCoin config for {len(config)} assets.\n")
+
+                    detail_json = detail_resp.json()
+                    detail_data = detail_json.get('data', {})
+
+                    chains = detail_data.get('chains', [])
+                    if not isinstance(chains, list):
+                        continue
+
+                    networks = []
+                    for chain_item in chains:
+                        chain_name = chain_item.get('chainName', '').upper()
+                        if not chain_name:
+                            continue
+                        networks.append({
+                            'chain': chain_name,
+                            'depositEnable': chain_item.get('isDepositEnabled', False),
+                            'withdrawEnable': chain_item.get('isWithdrawEnabled', False)
+                        })
+
+                    if networks:
+                        config[norm_coin] = networks
+
+                except Exception as detail_err:
+                    print(f"  ⚠️ Failed to fetch details for {coin}: {detail_err}")
+
+            if config:
+                print(f"✅ Successfully fetched KuCoin config for {len(config)} assets\n")
                 return config
+            else:
+                print("⚠️ No valid network data collected from KuCoin\n")
+                return {}
+
         except Exception as e:
-            print(f"❗ KuCoin config error (attempt {attempt+1}): {e}")
+            print(f"❗ KuCoin config fetch error (attempt {attempt+1}): {e}")
         time.sleep(2 ** attempt)
+
+    print("❌ All attempts to fetch KuCoin config failed – using empty config\n")
     return {}
 
 def fetch_kraken_config():
@@ -327,7 +378,6 @@ def check_arbitrage(prices, configs):
     }
 
     for base in all_bases:
-        # Main direction: Buy on MEXC → Sell on others
         for buy_exch in buy_exchanges:
             for sell_exch in sell_exchanges:
                 buy_sym = buy_quote = sell_sym = sell_quote = None
@@ -366,15 +416,14 @@ def check_arbitrage(prices, configs):
                 if profit_pct < THRESHOLD_PERCENT:
                     continue
 
-                # Status checks
                 buy_cfg = configs.get(buy_exch, {}).get(base)
                 sell_cfg = configs.get(sell_exch, {}).get(base)
+
                 if not buy_cfg or not buy_cfg.get('withdrawEnable', False):
                     continue
                 if not sell_cfg or not sell_cfg.get('depositEnable', False):
                     continue
 
-                # Network match check (only when both have network details)
                 network_note = ""
                 skip = False
                 if buy_exch in ['mexc', 'kucoin'] and sell_exch in ['mexc', 'kucoin']:
@@ -402,7 +451,7 @@ def check_arbitrage(prices, configs):
                 print(msg + "\n")
                 send_telegram(msg)
 
-        # Bidirectional checks (MEXC ↔ KuCoin ↔ Bitvavo) - apply same logic
+        # Bidirectional part (same logic)
         bidirectional_pairs = [
             ('mexc', 'kucoin'), ('kucoin', 'mexc'),
             ('mexc', 'bitvavo'), ('bitvavo', 'mexc'),
@@ -445,15 +494,14 @@ def check_arbitrage(prices, configs):
             if profit_pct < THRESHOLD_PERCENT:
                 continue
 
-            # Status checks
             buy_cfg = configs.get(buy_exch, {}).get(base)
             sell_cfg = configs.get(sell_exch, {}).get(base)
+
             if not buy_cfg or not buy_cfg.get('withdrawEnable', False):
                 continue
             if not sell_cfg or not sell_cfg.get('depositEnable', False):
                 continue
 
-            # Network match check
             network_note = ""
             skip = False
             if buy_exch in ['mexc', 'kucoin'] and sell_exch in ['mexc', 'kucoin']:
