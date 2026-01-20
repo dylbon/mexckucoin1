@@ -1,4 +1,3 @@
-```python
 import requests
 import time
 import signal
@@ -13,6 +12,7 @@ MAX_RETRIES = 3
 MEXC_TAKER_FEE = 0.0005
 KRAKEN_TAKER_FEE = 0.0026
 KUCOIN_TAKER_FEE = 0.001
+BITVAVO_TAKER_FEE = 0.0025  # Base taker fee for Bitvavo
 BLACKLIST = {'ALPHA', 'UTK', 'THETA', 'AERGO', 'MOVE'}  # Applied globally
 SYMBOL_MAP = {
     'LUNA': 'LUNC',
@@ -20,7 +20,7 @@ SYMBOL_MAP = {
     'BTT': 'BTTC',
     'NANO': 'XNO',
 }
-QUOTE_CURRENCIES = ['USDT', 'USD']  # Removed 'EUR'
+QUOTE_CURRENCIES = ['USDT', 'USDC', 'USD', 'EUR']  # Supports Bitvavo's common quotes
 
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -50,8 +50,6 @@ def fetch_mexc_tickers():
                 for d in data:
                     symbol = d['symbol']
                     norm_sym = normalize_symbol(symbol)
-                    if norm_sym.endswith('EUR'):
-                        continue
                     if any(norm_sym.endswith(q) for q in QUOTE_CURRENCIES):
                         prices[norm_sym] = {
                             'bid': float(d.get('bidPrice') or 0),
@@ -84,8 +82,6 @@ def fetch_kraken_tickers():
                         result = resp_t.json()['result']
                         for sym, d in result.items():
                             norm_sym = normalize_symbol(sym)
-                            if norm_sym.endswith('EUR'):
-                                continue
                             if any(norm_sym.endswith(q) for q in QUOTE_CURRENCIES):
                                 bid_price = float(d['b'][0])
                                 if bid_price > 0:
@@ -94,7 +90,7 @@ def fetch_kraken_tickers():
                                         'ask': float(d['a'][0]),
                                         'last': float(d['c'][0])
                                     }
-                print(f"✅ Fetched {len(prices)} Kraken listings (USD/USDT only). 🎯\n")
+                print(f"✅ Fetched {len(prices)} Kraken listings. 🎯\n")
                 return prices
         except Exception as e:
             print(f"❗ Kraken error (attempt {attempt+1}): {e}")
@@ -113,8 +109,6 @@ def fetch_kucoin_tickers():
                 for d in data:
                     symbol = d['symbol']
                     norm_sym = normalize_symbol(symbol)
-                    if norm_sym.endswith('EUR'):
-                        continue
                     if any(norm_sym.endswith(q) for q in QUOTE_CURRENCIES):
                         buy_str = d.get('buy') or '0'
                         sell_str = d.get('sell') or '0'
@@ -132,6 +126,44 @@ def fetch_kucoin_tickers():
     print("❌ Failed to fetch KuCoin after retries. 😔")
     return {}
 
+def fetch_bitvavo_tickers():
+    print("🔄 Fetching ALL Bitvavo tickers...")
+    prices = {}
+    for attempt in range(MAX_RETRIES):
+        try:
+            # Fetch book (best bid/ask)
+            resp_book = requests.get("https://api.bitvavo.com/v2/ticker/book", timeout=10)
+            if resp_book.status_code == 200:
+                data_book = resp_book.json()
+                for d in data_book:
+                    symbol = d['market']
+                    norm_sym = normalize_symbol(symbol)
+                    if any(norm_sym.endswith(q) for q in QUOTE_CURRENCIES):
+                        bid = float(d.get('bid') or 0)
+                        ask = float(d.get('ask') or 0)
+                        if bid > 0 and ask > 0:  # Require valid bid/ask
+                            prices[norm_sym] = {
+                                'bid': bid,
+                                'ask': ask,
+                                'last': 0  # Placeholder
+                            }
+            # Supplement last price (fallback only)
+            resp_price = requests.get("https://api.bitvavo.com/v2/ticker/price", timeout=10)
+            if resp_price.status_code == 200:
+                data_price = resp_price.json()
+                for d in data_price:
+                    symbol = d['market']
+                    norm_sym = normalize_symbol(symbol)
+                    if norm_sym in prices:
+                        prices[norm_sym]['last'] = float(d.get('price') or 0)
+            print(f"✅ Fetched {len(prices)} Bitvavo listings (with valid bid/ask). 🎯\n")
+            return prices
+        except Exception as e:
+            print(f"❗ Bitvavo error (attempt {attempt+1}): {e}")
+        time.sleep(2 ** attempt)
+    print("❌ Failed to fetch Bitvavo after retries. 😔")
+    return {}
+
 def normalize_symbol(symbol):
     symbol = symbol.replace('-', '').upper()
     symbol = symbol.replace('XXBT', 'BTC').replace('XBT', 'BTC').replace('ZUSD', 'USD').replace('ZEUR', 'EUR')
@@ -144,7 +176,7 @@ def normalize_symbol(symbol):
 def get_conversion_rate(prices, from_quote, to_quote):
     if from_quote == to_quote:
         return 1.0
-    for exch in ['kraken', 'mexc', 'kucoin']:
+    for exch in ['kraken', 'mexc', 'kucoin', 'bitvavo']:
         pair = f"{from_quote}{to_quote}"
         if pair in prices.get(exch, {}) and prices[exch][pair]['last'] > 0:
             return prices[exch][pair]['last']
@@ -166,14 +198,15 @@ def check_arbitrage(prices):
                     all_bases.add(base)
                     break
     buy_exchanges = ['mexc']
-    sell_exchanges = ['kraken', 'kucoin']
+    sell_exchanges = ['kraken', 'kucoin', 'bitvavo']
     fees = {
         'mexc': MEXC_TAKER_FEE,
         'kraken': KRAKEN_TAKER_FEE,
-        'kucoin': KUCOIN_TAKER_FEE
+        'kucoin': KUCOIN_TAKER_FEE,
+        'bitvavo': BITVAVO_TAKER_FEE
     }
     for base in all_bases:
-        # Main direction: Buy on MEXC → Sell on Kraken/KuCoin
+        # Main direction: Buy on MEXC → Sell on Kraken/KuCoin/Bitvavo
         for buy_exch in buy_exchanges:
             for sell_exch in sell_exchanges:
                 buy_sym = buy_quote = sell_sym = sell_quote = None
@@ -189,10 +222,16 @@ def check_arbitrage(prices):
                             sell_quote = q
                 if not buy_sym or not sell_sym:
                     continue
-                buy_ask = prices[buy_exch][buy_sym].get('ask') or prices[buy_exch][buy_sym]['last']
-                sell_bid = prices[sell_exch][sell_sym].get('bid') or prices[sell_exch][sell_sym]['last']
-                if buy_ask <= 0 or sell_bid <= 0:
-                    continue
+                buy_ask = prices[buy_exch][buy_sym].get('ask')
+                if buy_ask is None or buy_ask <= 0:
+                    buy_ask = prices[buy_exch][buy_sym].get('last')
+                    if buy_ask <= 0:
+                        continue
+                sell_bid = prices[sell_exch][sell_sym].get('bid')
+                if sell_bid is None or sell_bid <= 0:
+                    sell_bid = prices[sell_exch][sell_sym].get('last')
+                    if sell_bid <= 0:
+                        continue
                 conv = get_conversion_rate(prices, buy_quote, sell_quote)
                 if conv is None:
                     continue
@@ -209,8 +248,12 @@ def check_arbitrage(prices):
                     )
                     print(msg + "\n")
                     send_telegram(msg)
-        # Bidirectional MEXC ↔ KuCoin
-        for buy_exch, sell_exch in [('mexc', 'kucoin'), ('kucoin', 'mexc')]:
+
+        # Bidirectional checks: MEXC ↔ KuCoin ↔ Bitvavo
+        bidirectional_pairs = [('mexc', 'kucoin'), ('kucoin', 'mexc'),
+                               ('mexc', 'bitvavo'), ('bitvavo', 'mexc'),
+                               ('kucoin', 'bitvavo'), ('bitvavo', 'kucoin')]
+        for buy_exch, sell_exch in bidirectional_pairs:
             buy_sym = buy_quote = sell_sym = sell_quote = None
             for q in QUOTE_CURRENCIES:
                 cand = f"{base}{q}"
@@ -224,10 +267,16 @@ def check_arbitrage(prices):
                         sell_quote = q
             if not buy_sym or not sell_sym:
                 continue
-            buy_ask = prices[buy_exch][buy_sym].get('ask') or prices[buy_exch][buy_sym]['last']
-            sell_bid = prices[sell_exch][sell_sym].get('bid') or prices[sell_exch][sell_sym]['last']
-            if buy_ask <= 0 or sell_bid <= 0:
-                continue
+            buy_ask = prices[buy_exch][buy_sym].get('ask')
+            if buy_ask is None or buy_ask <= 0:
+                buy_ask = prices[buy_exch][buy_sym].get('last')
+                if buy_ask <= 0:
+                    continue
+            sell_bid = prices[sell_exch][sell_sym].get('bid')
+            if sell_bid is None or sell_bid <= 0:
+                sell_bid = prices[sell_exch][sell_sym].get('last')
+                if sell_bid <= 0:
+                    continue
             conv = get_conversion_rate(prices, buy_quote, sell_quote)
             if conv is None:
                 continue
@@ -244,6 +293,7 @@ def check_arbitrage(prices):
                 )
                 print(msg + "\n")
                 send_telegram(msg)
+
     if found == 0:
         print(f"😴 No opportunities ≥ {THRESHOLD_PERCENT}% found this cycle.\n")
     else:
@@ -255,13 +305,14 @@ def signal_handler(sig, frame):
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
-    print("🚀 Starting arbitrage bot (Only MEXC + Kraken + KuCoin bidirectional) 🌟\n")
+    print("🚀 Starting arbitrage bot (MEXC + Kraken + KuCoin + Bitvavo) 🌟\n")
     while True:
         try:
             prices = {
                 'mexc': fetch_mexc_tickers(),
                 'kraken': fetch_kraken_tickers(),
-                'kucoin': fetch_kucoin_tickers()
+                'kucoin': fetch_kucoin_tickers(),
+                'bitvavo': fetch_bitvavo_tickers()
             }
             check_arbitrage(prices)
             print(f"⏳ Waiting {CHECK_INTERVAL} seconds... 😴\n")
@@ -272,4 +323,3 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"❗ Unexpected error: {e}\nContinuing... 😔")
             time.sleep(CHECK_INTERVAL)
-```
