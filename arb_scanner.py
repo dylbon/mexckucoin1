@@ -1,3 +1,4 @@
+```python
 import requests
 import time
 import signal
@@ -6,24 +7,20 @@ import sys
 # === CONFIG ===
 BOT_TOKEN = "8212674831:AAFQPexNzzYeprq3J8OuSSNBYsJQE6JM87s"  # New bot
 CHAT_ID = "7297679984"  # Confirmed chat
-THRESHOLD_PERCENT = 3.0          # 3% profit threshold
-CHECK_INTERVAL = 60              # Check every 60 seconds
+THRESHOLD_PERCENT = 3.0  # 3% profit threshold
+CHECK_INTERVAL = 60  # Check every 60 seconds
 MAX_RETRIES = 3
-
 MEXC_TAKER_FEE = 0.0005
 KRAKEN_TAKER_FEE = 0.0026
 KUCOIN_TAKER_FEE = 0.001
-
 BLACKLIST = {'ALPHA', 'UTK', 'THETA', 'AERGO', 'MOVE'}  # Applied globally
-
 SYMBOL_MAP = {
     'LUNA': 'LUNC',
     'LUNA2': 'LUNA',
     'BTT': 'BTTC',
     'NANO': 'XNO',
 }
-
-QUOTE_CURRENCIES = ['USDT', 'USD', 'EUR']
+QUOTE_CURRENCIES = ['USDT', 'USD']  # Removed 'EUR'
 
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -52,8 +49,11 @@ def fetch_mexc_tickers():
                 prices = {}
                 for d in data:
                     symbol = d['symbol']
-                    if any(symbol.endswith(q) for q in QUOTE_CURRENCIES):
-                        prices[symbol] = {
+                    norm_sym = normalize_symbol(symbol)
+                    if norm_sym.endswith('EUR'):
+                        continue
+                    if any(norm_sym.endswith(q) for q in QUOTE_CURRENCIES):
+                        prices[norm_sym] = {
                             'bid': float(d.get('bidPrice') or 0),
                             'ask': float(d.get('askPrice') or 0),
                             'last': float(d['lastPrice'])
@@ -83,12 +83,13 @@ def fetch_kraken_tickers():
                     if resp_t.status_code == 200:
                         result = resp_t.json()['result']
                         for sym, d in result.items():
-                            if 'EUR' in sym or 'ZEUR' in sym:
+                            norm_sym = normalize_symbol(sym)
+                            if norm_sym.endswith('EUR'):
                                 continue
-                            if any(q in sym for q in ['USD', 'USDT']):
+                            if any(norm_sym.endswith(q) for q in QUOTE_CURRENCIES):
                                 bid_price = float(d['b'][0])
                                 if bid_price > 0:
-                                    prices[sym] = {
+                                    prices[norm_sym] = {
                                         'bid': bid_price,
                                         'ask': float(d['a'][0]),
                                         'last': float(d['c'][0])
@@ -111,11 +112,14 @@ def fetch_kucoin_tickers():
                 prices = {}
                 for d in data:
                     symbol = d['symbol']
-                    if any(q in symbol for q in QUOTE_CURRENCIES):
+                    norm_sym = normalize_symbol(symbol)
+                    if norm_sym.endswith('EUR'):
+                        continue
+                    if any(norm_sym.endswith(q) for q in QUOTE_CURRENCIES):
                         buy_str = d.get('buy') or '0'
                         sell_str = d.get('sell') or '0'
                         last_str = d.get('last') or '0'
-                        prices[symbol] = {
+                        prices[norm_sym] = {
                             'bid': float(buy_str),
                             'ask': float(sell_str),
                             'last': float(last_str)
@@ -130,39 +134,37 @@ def fetch_kucoin_tickers():
 
 def normalize_symbol(symbol):
     symbol = symbol.replace('-', '').upper()
-    symbol = symbol.replace('XXBT', 'BTC').replace('XBT', 'BTC').replace('ZUSD', 'USD')
-    if len(symbol) > 3:
-        base = SYMBOL_MAP.get(symbol[:-3], symbol[:-3])
-        quote = symbol[-3:]
-    else:
-        base = symbol
-        quote = ''
-    return f"{base}{quote}"
+    symbol = symbol.replace('XXBT', 'BTC').replace('XBT', 'BTC').replace('ZUSD', 'USD').replace('ZEUR', 'EUR')
+    for q in sorted(QUOTE_CURRENCIES, key=len, reverse=True):
+        if symbol.endswith(q):
+            base = SYMBOL_MAP.get(symbol[:-len(q)], symbol[:-len(q)])
+            return f"{base}{q}"
+    return symbol
 
 def get_conversion_rate(prices, from_quote, to_quote):
     if from_quote == to_quote:
         return 1.0
-    pair = f"{from_quote}{to_quote}"
-    if pair in prices['mexc'] and prices['mexc'][pair]['last'] > 0:
-        return prices['mexc'][pair]['last']
-    inv_pair = f"{to_quote}{from_quote}"
-    if inv_pair in prices['mexc'] and prices['mexc'][inv_pair]['last'] > 0:
-        return 1.0 / prices['mexc'][inv_pair]['last']
+    for exch in ['kraken', 'mexc', 'kucoin']:
+        pair = f"{from_quote}{to_quote}"
+        if pair in prices.get(exch, {}) and prices[exch][pair]['last'] > 0:
+            return prices[exch][pair]['last']
+        inv_pair = f"{to_quote}{from_quote}"
+        if inv_pair in prices.get(exch, {}) and prices[exch][inv_pair]['last'] > 0:
+            return 1.0 / prices[exch][inv_pair]['last']
     return None
 
 def check_arbitrage(prices):
     found = 0
     all_bases = set()
-
     for exch_prices in prices.values():
         for sym in exch_prices:
-            norm = normalize_symbol(sym)
-            if len(norm) > 3:
-                base = norm[:-3]
-                if base in BLACKLIST:
-                    continue
-                all_bases.add(base)
-
+            for q in sorted(QUOTE_CURRENCIES, key=len, reverse=True):
+                if sym.endswith(q):
+                    base = sym[:-len(q)]
+                    if base in BLACKLIST:
+                        continue
+                    all_bases.add(base)
+                    break
     buy_exchanges = ['mexc']
     sell_exchanges = ['kraken', 'kucoin']
     fees = {
@@ -170,7 +172,6 @@ def check_arbitrage(prices):
         'kraken': KRAKEN_TAKER_FEE,
         'kucoin': KUCOIN_TAKER_FEE
     }
-
     for base in all_bases:
         # Main direction: Buy on MEXC → Sell on Kraken/KuCoin
         for buy_exch in buy_exchanges:
@@ -179,30 +180,25 @@ def check_arbitrage(prices):
                 for q in QUOTE_CURRENCIES:
                     cand = f"{base}{q}"
                     if cand in prices.get(buy_exch, {}):
-                        buy_sym = cand if buy_sym is None else buy_sym
-                        buy_quote = q if buy_quote is None else buy_quote
+                        if buy_sym is None:
+                            buy_sym = cand
+                            buy_quote = q
                     if cand in prices.get(sell_exch, {}):
-                        sell_sym = cand
-                        sell_quote = q
-
+                        if sell_sym is None:
+                            sell_sym = cand
+                            sell_quote = q
                 if not buy_sym or not sell_sym:
                     continue
-
                 buy_ask = prices[buy_exch][buy_sym].get('ask') or prices[buy_exch][buy_sym]['last']
                 sell_bid = prices[sell_exch][sell_sym].get('bid') or prices[sell_exch][sell_sym]['last']
-
                 if buy_ask <= 0 or sell_bid <= 0:
                     continue
-
                 conv = get_conversion_rate(prices, buy_quote, sell_quote)
                 if conv is None:
                     continue
-
                 adjusted_buy = buy_ask * (1 + fees[buy_exch]) * conv
                 adjusted_sell = sell_bid * (1 - fees[sell_exch])
-
                 profit_pct = (adjusted_sell - adjusted_buy) / adjusted_buy * 100
-
                 if profit_pct >= THRESHOLD_PERCENT:
                     found += 1
                     msg = (
@@ -213,37 +209,31 @@ def check_arbitrage(prices):
                     )
                     print(msg + "\n")
                     send_telegram(msg)
-
         # Bidirectional MEXC ↔ KuCoin
         for buy_exch, sell_exch in [('mexc', 'kucoin'), ('kucoin', 'mexc')]:
             buy_sym = buy_quote = sell_sym = sell_quote = None
             for q in QUOTE_CURRENCIES:
                 cand = f"{base}{q}"
                 if cand in prices.get(buy_exch, {}):
-                    buy_sym = cand if buy_sym is None else buy_sym
-                    buy_quote = q if buy_quote is None else buy_quote
+                    if buy_sym is None:
+                        buy_sym = cand
+                        buy_quote = q
                 if cand in prices.get(sell_exch, {}):
-                    sell_sym = cand
-                    sell_quote = q
-
+                    if sell_sym is None:
+                        sell_sym = cand
+                        sell_quote = q
             if not buy_sym or not sell_sym:
                 continue
-
             buy_ask = prices[buy_exch][buy_sym].get('ask') or prices[buy_exch][buy_sym]['last']
             sell_bid = prices[sell_exch][sell_sym].get('bid') or prices[sell_exch][sell_sym]['last']
-
             if buy_ask <= 0 or sell_bid <= 0:
                 continue
-
             conv = get_conversion_rate(prices, buy_quote, sell_quote)
             if conv is None:
                 continue
-
             adjusted_buy = buy_ask * (1 + fees[buy_exch]) * conv
             adjusted_sell = sell_bid * (1 - fees[sell_exch])
-
             profit_pct = (adjusted_sell - adjusted_buy) / adjusted_buy * 100
-
             if profit_pct >= THRESHOLD_PERCENT:
                 found += 1
                 msg = (
@@ -254,7 +244,6 @@ def check_arbitrage(prices):
                 )
                 print(msg + "\n")
                 send_telegram(msg)
-
     if found == 0:
         print(f"😴 No opportunities ≥ {THRESHOLD_PERCENT}% found this cycle.\n")
     else:
@@ -283,3 +272,4 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"❗ Unexpected error: {e}\nContinuing... 😔")
             time.sleep(CHECK_INTERVAL)
+```
