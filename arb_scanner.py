@@ -24,7 +24,7 @@ BLACKLIST = {
     'PIPE', 'FLOW',
     'TAKE', 'CHECK', 'SONIC', 'PORTAL', 'ART', 'UNITE', 'AIO',
     'L3', 'RVV', 'U2U',
-    'DUCK', 'SAMO','SKR','NODL'
+    'DUCK', 'SAMO','SKR','NODL', 'GWEI', 'U'
 }
 
 SYMBOL_MAP = {
