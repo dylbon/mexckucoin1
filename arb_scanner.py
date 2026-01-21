@@ -6,10 +6,10 @@ import sys
 # === CONFIG ===
 BOT_TOKEN = "8212674831:AAFQPexNzzYeprq3J8OuSSNBYsJQE6JM87s"
 CHAT_ID = "7297679984"
-THRESHOLD_PERCENT = 5.0
+THRESHOLD_PERCENT = 3.0
 MIN_RAW_SPREAD_PCT = 4.0
 MAX_RAW_SPREAD_PCT = 200.0
-MIN_KRAKEN_24H_VOLUME_BASE = 10000.0   # minimum 24h volume in base asset units
+MIN_KRAKEN_24H_VOLUME_BASE = 10000.0   # min 24h volume in base units to consider Kraken pair valid
 CHECK_INTERVAL = 60
 MAX_RETRIES = 3
 
@@ -17,7 +17,6 @@ MEXC_TAKER_FEE    = 0.0005
 KRAKEN_TAKER_FEE  = 0.0026
 BITVAVO_TAKER_FEE = 0.0025
 
-# Blacklist — DUCK and SAMO added
 BLACKLIST = {
     'ALPHA', 'UTK', 'THETA', 'AERGO', 'MOVE',
     'SRM', 'ACA', 'TUSD', 'MICHI', 'ANLOG', 'EVAA', 'FOREST',
@@ -85,7 +84,7 @@ def fetch_kraken_usd_to_eur_rate():
     return None
 
 def fetch_kraken_tickers():
-    print("Fetching Kraken BID prices (USD pairs only)...")
+    print("Fetching Kraken BID + ASK prices (USD pairs only)...")
     prices = {}
     fiat_rate = fetch_kraken_usd_to_eur_rate()
 
@@ -105,11 +104,14 @@ def fetch_kraken_tickers():
                 if norm.endswith('USD'):
                     base = norm[:-3]
                     bid = float(d['b'][0])
-                    vol_24h = float(d['v'][1])  # 24h volume in base currency
-                    if bid > 0:
+                    ask = float(d['a'][0])
+                    vol_24h = float(d['v'][1])
+                    if bid > 0 and ask > 0:
                         prices[base] = {
                             'bid_usd': bid,
+                            'ask_usd': ask,
                             'bid_eur': bid * fiat_rate if fiat_rate else None,
+                            'ask_eur': ask * fiat_rate if fiat_rate else None,
                             'vol_24h_base': vol_24h
                         }
         print(f"Kraken: {len(prices)} USD-based assets loaded")
@@ -221,7 +223,8 @@ def check_arbitrage():
         if vol_24h < MIN_KRAKEN_24H_VOLUME_BASE:
             continue
 
-        k_eur = k_data['bid_eur'] if 'bid_eur' in k_data else None
+        k_bid_eur = k_data.get('bid_eur')
+        k_ask_eur = k_data.get('ask_eur')
 
         b_eur = bitvavo.get(base)
 
@@ -235,30 +238,37 @@ def check_arbitrage():
 
         opps = []
 
+        # Buy Bitvavo ASK → Sell MEXC last
         if b_eur and m_eur:
             opp = check_opportunity(b_eur, BITVAVO_TAKER_FEE, m_eur, MEXC_TAKER_FEE,
                                     base, "Bitvavo", "MEXC")
             if opp: opps.append(opp)
 
-        if b_eur and k_eur:
-            opp = check_opportunity(b_eur, BITVAVO_TAKER_FEE, k_eur, KRAKEN_TAKER_FEE,
+        # Buy Bitvavo ASK → Sell Kraken BID
+        if b_eur and k_bid_eur:
+            opp = check_opportunity(b_eur, BITVAVO_TAKER_FEE, k_bid_eur, KRAKEN_TAKER_FEE,
                                     base, "Bitvavo", "Kraken")
             if opp: opps.append(opp)
 
-        if m_eur and k_eur:
-            opp = check_opportunity(m_eur, MEXC_TAKER_FEE, k_eur, KRAKEN_TAKER_FEE,
+        # Buy MEXC last → Sell Kraken BID
+        if m_eur and k_bid_eur:
+            opp = check_opportunity(m_eur, MEXC_TAKER_FEE, k_bid_eur, KRAKEN_TAKER_FEE,
                                     base, "MEXC", "Kraken")
             if opp: opps.append(opp)
 
-        if k_eur and m_eur:
-            opp = check_opportunity(k_eur, KRAKEN_TAKER_FEE, m_eur, MEXC_TAKER_FEE,
+        # Buy Kraken ASK → Sell MEXC last
+        if k_ask_eur and m_eur:
+            opp = check_opportunity(k_ask_eur, KRAKEN_TAKER_FEE, m_eur, MEXC_TAKER_FEE,
                                     base, "Kraken", "MEXC")
             if opp: opps.append(opp)
 
-        if k_eur and b_eur:
-            opp = check_opportunity(k_eur, KRAKEN_TAKER_FEE, b_eur, BITVAVO_TAKER_FEE,
-                                    base, "Kraken", "Bitvavo")
-            if opp: opps.append(opp)
+        # Buy Kraken ASK → Sell Bitvavo ASK (not ideal, but included for completeness)
+        # Note: Bitvavo ASK is buy price → for sell we'd need BID, but we don't fetch it yet
+        # Skip for now or approximate if needed
+        # if k_ask_eur and b_eur:
+        #     opp = check_opportunity(k_ask_eur, KRAKEN_TAKER_FEE, b_eur, BITVAVO_TAKER_FEE,
+        #                             base, "Kraken", "Bitvavo")
+        #     if opp: opps.append(opp)
 
         for opp in opps:
             found += 1
@@ -272,7 +282,7 @@ def check_arbitrage():
             send_telegram(msg)
 
     if found == 0:
-        print(f"No ≥ {THRESHOLD_PERCENT}% opportunities (EUR basis + Kraken volume filter)")
+        print(f"No ≥ {THRESHOLD_PERCENT}% opportunities (EUR basis + volume filter)")
     else:
         print(f"Found {found} opportunities!")
 
@@ -282,7 +292,7 @@ def signal_handler(sig, frame):
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
-    print("Arb bot running — min raw spread 4%, max 200%, Kraken 24h vol ≥", MIN_KRAKEN_24H_VOLUME_BASE)
+    print("Arb bot running — Kraken BUY=ASK / SELL=BID + volume filter ≥", MIN_KRAKEN_24H_VOLUME_BASE)
     print("Blacklisted:", ', '.join(sorted(BLACKLIST)))
     while True:
         try:
