@@ -16,12 +16,14 @@ MEXC_TAKER_FEE    = 0.0005
 KRAKEN_TAKER_FEE  = 0.0026
 BITVAVO_TAKER_FEE = 0.0025
 
-# Expanded blacklist with your latest request
+# Blacklist — all your requested symbols added
 BLACKLIST = {
     'ALPHA', 'UTK', 'THETA', 'AERGO', 'MOVE',
     'SRM', 'ACA', 'TUSD', 'MICHI', 'ANLOG', 'EVAA', 'FOREST',
     'HOUSE', 'PDA', 'XL1', 'ELX', 'NEIRO', 'TANSSI', 'ETHW',
-    'PIPE', 'FLOW'
+    'PIPE', 'FLOW',
+    'TAKE', 'CHECK', 'SONIC', 'PORTAL', 'ART', 'UNITE', 'AIO',
+    'L3', 'RVV', 'U2U'
 }
 
 SYMBOL_MAP = {
@@ -205,7 +207,7 @@ def check_arbitrage():
     for base_raw in all_bases:
         base = normalize_base(base_raw)
         if base in BLACKLIST:
-            continue
+            continue  # Skip blacklisted symbols
 
         k_data = kraken_data.get(base)
         k_eur = k_data['bid_eur'] if k_data and 'bid_eur' in k_data else None
@@ -269,7 +271,7 @@ def signal_handler(sig, frame):
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
-    print("Arb bot running — min raw spread 4%, max 200%, EUR basis\n")
+    print("Arb bot running — min raw spread 4%, max 200%, EUR basis")
     print("Blacklisted:", ', '.join(sorted(BLACKLIST)))
     while True:
         try:
