@@ -6,12 +6,9 @@ import sys
 # === CONFIG ===
 BOT_TOKEN = "8212674831:AAFQPexNzzYeprq3J8OuSSNBYsJQE6JM87s"
 CHAT_ID = "7297679984"
-THRESHOLD_PERCENT = 0
+THRESHOLD_PERCENT = 4.5
 MIN_RAW_SPREAD_PCT = 5.0
 MAX_RAW_SPREAD_PCT = 200.0
-
-MIN_KRAKEN_24H_VOLUME_BASE = 10000.0   # min 24h volume in base units for Kraken
-MIN_MEXC_24H_VOLUME_USDT   = 50000.0   # min 24h USDT volume for MEXC
 
 CHECK_INTERVAL = 60
 MAX_RETRIES = 3
@@ -20,8 +17,6 @@ BITVAVO_TAKER_FEE = 0.0025
 MEXC_TAKER_FEE    = 0.0005
 BINANCE_TAKER_FEE = 0.0010
 KRAKEN_TAKER_FEE  = 0.0026
-
-# BLACKLIST HAS BEEN REMOVED
 
 SYMBOL_MAP = {
     'LUNA': 'LUNA',
@@ -47,31 +42,18 @@ def send_telegram(text):
         time.sleep(2 ** attempt)
     print("❌ Telegram failed.")
 
-def fetch_kraken_usd_to_eur_rate():
-    print("Fetching Kraken USD → EUR rate...")
-    FIAT_PAIR_ATTEMPTS = ['EURUSD', 'USDEUR', 'ZEURZUSD', 'ZUSDZEUR', 'EUR/USD', 'USD/EUR']
-    for pair_try in FIAT_PAIR_ATTEMPTS:
-        try:
-            url = f"https://api.kraken.com/0/public/Ticker?pair={pair_try}"
-            r = requests.get(url, timeout=8)
-            data = r.json()
-            if 'error' in data and data['error']:
-                continue
-            result = data.get('result', {})
-            if not result:
-                continue
-            ticker_key = next(iter(result))
-            ticker = result[ticker_key]
-            c = float(ticker['c'][0])
-            if 'EUR' in ticker_key.upper() and 'USD' in ticker_key.upper():
-                rate = 1 / c if ('EUR' in ticker_key[:4] or 'ZEUR' in ticker_key) else c
-                if rate and 0.5 < rate < 2.0:
-                    print(f"→ 1 USD ≈ {rate:.4f} EUR")
-                    return rate
-        except Exception:
-            continue
-    print("❌ Failed to get USD/EUR rate from Kraken")
-    return None
+def fetch_binance_usd_to_eur_rate():
+    print("Fetching Binance USD → EUR rate (EURUSDT)...")
+    try:
+        r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=EURUSDT", timeout=8)
+        data = r.json()
+        eur_usdt = float(data['price'])
+        rate = 1.0 / eur_usdt
+        print(f"→ 1 USD ≈ {rate:.4f} EUR")
+        return rate
+    except Exception as e:
+        print(f"Binance rate fetch failed: {e}")
+        return None
 
 def fetch_bitvavo_tickers():
     print("Fetching Bitvavo ASK (best offer) from orderbook...")
@@ -90,11 +72,10 @@ def fetch_bitvavo_tickers():
         print(f"Bitvavo fetch failed: {e}")
         return {}
 
-def fetch_mexc_bid_and_volume():
-    print("Fetching MEXC BID + 24h volume...")
+def fetch_mexc_bid():
+    print("Fetching MEXC BID...")
     prices = {}
     try:
-        # Real BID
         r = requests.get("https://api.mexc.com/api/v3/ticker/bookTicker", timeout=10)
         for d in r.json():
             sym = d['symbol'].upper()
@@ -102,17 +83,7 @@ def fetch_mexc_bid_and_volume():
                 base = sym[:-4]
                 bid = float(d.get('bidPrice') or 0)
                 if bid > 0:
-                    prices[base] = {'bid': bid}
-        
-        # 24h volume filter
-        vol_r = requests.get("https://api.mexc.com/api/v3/ticker/24hr", timeout=10)
-        for d in vol_r.json():
-            sym = d['symbol'].upper()
-            if sym.endswith('USDT') and 'quoteVolume' in d:
-                base = sym[:-4]
-                vol = float(d.get('quoteVolume') or 0)
-                if base in prices:
-                    prices[base]['vol_usdt'] = vol
+                    prices[base] = bid
         print(f"MEXC: {len(prices)} assets with BID")
         return prices
     except Exception as e:
@@ -137,8 +108,8 @@ def fetch_binance_bid():
         print(f"Binance fetch failed: {e}")
         return {}
 
-def fetch_kraken_tickers(fiat_rate):
-    print("Fetching Kraken BID + 24h volume...")
+def fetch_kraken_bid(fiat_rate):
+    print("Fetching Kraken BID...")
     prices = {}
     try:
         r = requests.get("https://api.kraken.com/0/public/AssetPairs", timeout=12)
@@ -156,12 +127,8 @@ def fetch_kraken_tickers(fiat_rate):
                 if norm.endswith('USD'):
                     base = norm[:-3]
                     bid = float(d['b'][0])
-                    vol_24h = float(d['v'][1])
-                    if bid > 0:
-                        prices[base] = {
-                            'bid_eur': bid * fiat_rate if fiat_rate else None,
-                            'vol_24h_base': vol_24h
-                        }
+                    if bid > 0 and fiat_rate:
+                        prices[base] = bid * fiat_rate
         print(f"Kraken: {len(prices)} assets with BID")
         return prices
     except Exception as e:
@@ -207,14 +174,16 @@ def check_opportunity(buy_price, buy_fee, sell_price, sell_fee, base, buy_exch, 
     return None
 
 def check_arbitrage():
-    bitvavo = fetch_bitvavo_tickers()
-    mexc    = fetch_mexc_bid_and_volume()
-    binance = fetch_binance_bid()
-    fiat_rate = fetch_kraken_usd_to_eur_rate()
-    kraken  = fetch_kraken_tickers(fiat_rate) if fiat_rate else {}
-
+    # === FETCH BINANCE RATE FIRST ===
+    fiat_rate = fetch_binance_usd_to_eur_rate()
     if not fiat_rate:
-        print("⚠️ No USD→EUR rate available — some comparisons skipped")
+        print("⚠️ Failed to get USD→EUR rate from Binance — skipping this cycle")
+        return
+
+    bitvavo = fetch_bitvavo_tickers()
+    mexc    = fetch_mexc_bid()
+    binance = fetch_binance_bid()
+    kraken  = fetch_kraken_bid(fiat_rate)
 
     found = 0
     all_bases = set(bitvavo.keys()) | set(mexc.keys()) | set(binance.keys()) | set(kraken.keys())
@@ -226,10 +195,10 @@ def check_arbitrage():
         if not b_ask_eur:
             continue
 
-        # === Bitvavo BUY → MEXC SELL ===
-        m_data = mexc.get(base)
-        if m_data and 'bid' in m_data and m_data.get('vol_usdt', 0) >= MIN_MEXC_24H_VOLUME_USDT:
-            m_bid_eur = m_data['bid'] * fiat_rate
+        # Bitvavo BUY → MEXC SELL
+        m_bid = mexc.get(base)
+        if m_bid:
+            m_bid_eur = m_bid * fiat_rate
             opp = check_opportunity(b_ask_eur, BITVAVO_TAKER_FEE, m_bid_eur, MEXC_TAKER_FEE,
                                     base, "Bitvavo", "MEXC")
             if opp:
@@ -238,7 +207,7 @@ def check_arbitrage():
                 print(msg + "\n")
                 send_telegram(msg)
 
-        # === Bitvavo BUY → Binance SELL ===
+        # Bitvavo BUY → Binance SELL
         b_bid = binance.get(base)
         if b_bid:
             b_bid_eur = b_bid * fiat_rate
@@ -250,18 +219,16 @@ def check_arbitrage():
                 print(msg + "\n")
                 send_telegram(msg)
 
-        # === Bitvavo BUY → Kraken SELL ===
-        k_data = kraken.get(base)
-        if k_data and k_data.get('vol_24h_base', 0) >= MIN_KRAKEN_24H_VOLUME_BASE:
-            k_bid_eur = k_data.get('bid_eur')
-            if k_bid_eur:
-                opp = check_opportunity(b_ask_eur, BITVAVO_TAKER_FEE, k_bid_eur, KRAKEN_TAKER_FEE,
-                                        base, "Bitvavo", "Kraken")
-                if opp:
-                    found += 1
-                    msg = f"*🚀 Arb Alert!*\nBuy **{opp['base']}** on {opp['buy_exch']} @ €{opp['buy_p']:.6f}\nSell on {opp['sell_exch']} @ €{opp['sell_p']:.6f}\n→ Profit **{opp['profit']:.2f}%** (raw {opp['raw']:.2f}%)"
-                    print(msg + "\n")
-                    send_telegram(msg)
+        # Bitvavo BUY → Kraken SELL
+        k_bid_eur = kraken.get(base)
+        if k_bid_eur:
+            opp = check_opportunity(b_ask_eur, BITVAVO_TAKER_FEE, k_bid_eur, KRAKEN_TAKER_FEE,
+                                    base, "Bitvavo", "Kraken")
+            if opp:
+                found += 1
+                msg = f"*🚀 Arb Alert!*\nBuy **{opp['base']}** on {opp['buy_exch']} @ €{opp['buy_p']:.6f}\nSell on {opp['sell_exch']} @ €{opp['sell_p']:.6f}\n→ Profit **{opp['profit']:.2f}%** (raw {opp['raw']:.2f}%)"
+                print(msg + "\n")
+                send_telegram(msg)
 
     if found == 0:
         print(f"No ≥ {THRESHOLD_PERCENT}% opportunities found (Bitvavo BUY → MEXC/Binance/Kraken SELL)")
@@ -275,7 +242,7 @@ def signal_handler(sig, frame):
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     print("🚀 Arb bot running — Buy Bitvavo ASK → Sell MEXC / Binance / Kraken BID")
-    print("Blacklist: REMOVED (all coins are now considered)")
+    print("No volume filters • No blacklist • Binance rate first")
     while True:
         try:
             check_arbitrage()
